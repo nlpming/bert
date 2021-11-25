@@ -21,6 +21,7 @@ from __future__ import print_function
 import collections
 import csv
 import os
+import pdb
 import modeling
 import optimization
 import tokenization
@@ -298,6 +299,7 @@ class MrpcProcessor(DataProcessor):
 
   def get_train_examples(self, data_dir):
     """See base class."""
+    #pdb.set_trace()
     return self._create_examples(
         self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
@@ -376,7 +378,19 @@ class ColaProcessor(DataProcessor):
 
 def convert_single_example(ex_index, example, label_list, max_seq_length,
                            tokenizer):
-  """Converts a single `InputExample` into a single `InputFeatures`."""
+  """Converts a single `InputExample` into a single `InputFeatures`.
+
+  For examples:
+  # The convention in BERT is:
+  # (a) For sequence pairs:
+  #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+  #  type_ids: 0     0  0    0    0     0       0 0     1  1  1  1   1 1
+  # (b) For single sequences:
+  #  tokens:   [CLS] the dog is hairy . [SEP]
+  # input_ids: 2    23   100 34 45   45 78 0 0 0 0 0
+  #  type_ids: 0     0   0   0  0     0 0 0 0 0 0 0
+  #input_mask: 1     1   1   1  1     1 1 0 0 0 0 0
+  """
 
   if isinstance(example, PaddingInputExample):
     return InputFeatures(
@@ -486,6 +500,7 @@ def file_based_convert_examples_to_features(
     if ex_index % 10000 == 0:
       tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
+    # 单个样本的处理: tokenizer -> index
     feature = convert_single_example(ex_index, example, label_list,
                                      max_seq_length, tokenizer)
 
@@ -493,6 +508,7 @@ def file_based_convert_examples_to_features(
       f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
       return f
 
+    # 定义tfrecord feature
     features = collections.OrderedDict()
     features["input_ids"] = create_int_feature(feature.input_ids)
     features["input_mask"] = create_int_feature(feature.input_mask)
@@ -501,6 +517,7 @@ def file_based_convert_examples_to_features(
     features["is_real_example"] = create_int_feature(
         [int(feature.is_real_example)])
 
+    # 定义tfrecord example
     tf_example = tf.train.Example(features=tf.train.Features(feature=features))
     writer.write(tf_example.SerializeToString())
   writer.close()
@@ -539,16 +556,18 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
+    d = d.map(lambda x: _decode_record(x, name_to_features))
     if is_training:
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
 
-    d = d.apply(
-        tf.contrib.data.map_and_batch(
-            lambda record: _decode_record(record, name_to_features),
-            batch_size=batch_size,
-            drop_remainder=drop_remainder))
+    d = d.batch(batch_size, drop_remainder=drop_remainder)
 
+    #d = d.apply(
+    #    tf.contrib.data.map_and_batch(
+    #        lambda record: _decode_record(record, name_to_features),
+    #        batch_size=batch_size,
+    #        drop_remainder=drop_remainder))
     return d
 
   return input_fn
@@ -574,6 +593,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                  labels, num_labels, use_one_hot_embeddings):
   """Creates a classification model."""
+  # bert模型定义
   model = modeling.BertModel(
       config=bert_config,
       is_training=is_training,
@@ -598,6 +618,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
   output_bias = tf.get_variable(
       "output_bias", [num_labels], initializer=tf.zeros_initializer())
 
+  # 定义Loss
   with tf.variable_scope("loss"):
     if is_training:
       # I.e., 0.1 dropout
@@ -606,12 +627,12 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     logits = tf.matmul(output_layer, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     probabilities = tf.nn.softmax(logits, axis=-1)
-    log_probs = tf.nn.log_softmax(logits, axis=-1)
+    log_probs = tf.nn.log_softmax(logits, axis=-1) # [batch_size, num_classes]
 
     one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
 
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
-    loss = tf.reduce_mean(per_example_loss)
+    loss = tf.reduce_mean(per_example_loss) # 负对数似然损失函数/交叉熵损失函数
 
     return (loss, per_example_loss, logits, probabilities)
 
@@ -624,6 +645,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
     """The `model_fn` for TPUEstimator."""
 
+    # 输入数据：input_ids,input_mask,segment_ids,label_ids
     tf.logging.info("*** Features ***")
     for name in sorted(features.keys()):
       tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
@@ -638,8 +660,10 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     else:
       is_real_example = tf.ones(tf.shape(label_ids), dtype=tf.float32)
 
+    # 是否训练模式
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
+    # 创建bert model + 分类模型
     (total_loss, per_example_loss, logits, probabilities) = create_model(
         bert_config, is_training, input_ids, input_mask, segment_ids, label_ids,
         num_labels, use_one_hot_embeddings)
@@ -647,11 +671,12 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     tvars = tf.trainable_variables()
     initialized_variable_names = {}
     scaffold_fn = None
+
+    # 获取预训练模型参数
     if init_checkpoint:
       (assignment_map, initialized_variable_names
       ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
       if use_tpu:
-
         def tpu_scaffold():
           tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
           return tf.train.Scaffold()
@@ -660,6 +685,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
       else:
         tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
+    # 打印模型参数
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
       init_string = ""
@@ -669,18 +695,17 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                       init_string)
 
     output_spec = None
-    if mode == tf.estimator.ModeKeys.TRAIN:
-
+    if mode == tf.estimator.ModeKeys.TRAIN: # training过程
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu) #创建优化器
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      #output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
           scaffold_fn=scaffold_fn)
-    elif mode == tf.estimator.ModeKeys.EVAL:
-
+    elif mode == tf.estimator.ModeKeys.EVAL: # eval过程
       def metric_fn(per_example_loss, label_ids, logits, is_real_example):
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
         accuracy = tf.metrics.accuracy(
@@ -693,13 +718,15 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
       eval_metrics = (metric_fn,
                       [per_example_loss, label_ids, logits, is_real_example])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      #output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
           eval_metrics=eval_metrics,
           scaffold_fn=scaffold_fn)
-    else:
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+    else: # predict过程
+      #output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
           mode=mode,
           predictions={"probabilities": probabilities},
           scaffold_fn=scaffold_fn)
@@ -781,8 +808,10 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
 
 
 def main(_):
-  tf.logging.set_verbosity(tf.logging.INFO)
+  pdb.set_trace()
+  tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
+  # fine-tunning数据处理器
   processors = {
       "cola": ColaProcessor,
       "mnli": MnliProcessor,
@@ -790,6 +819,7 @@ def main(_):
       "xnli": XnliProcessor,
   }
 
+  # 验证uncased/cased
   tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
                                                 FLAGS.init_checkpoint)
 
@@ -797,6 +827,7 @@ def main(_):
     raise ValueError(
         "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
+  #读取配置文件bert_config.json
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
   if FLAGS.max_seq_length > bert_config.max_position_embeddings:
@@ -805,7 +836,8 @@ def main(_):
         "was only trained up to sequence length %d" %
         (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
-  tf.gfile.MakeDirs(FLAGS.output_dir)
+  #tf.gfile.MakeDirs(FLAGS.output_dir)
+  tf.io.gfile.makedirs(FLAGS.output_dir)
 
   task_name = FLAGS.task_name.lower()
 
@@ -813,37 +845,44 @@ def main(_):
     raise ValueError("Task not found: %s" % (task_name))
 
   processor = processors[task_name]()
-
+  # 获取label
   label_list = processor.get_labels()
 
+  # tokenizer处理器
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
   tpu_cluster_resolver = None
   if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+    #tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+    tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
+  # estimator 定义runconfig
+  #is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+  is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+  #run_config = tf.contrib.tpu.RunConfig(
+  run_config = tf.compat.v1.estimator.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
       save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
+      tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
           per_host_input_for_training=is_per_host))
 
-  train_examples = None
+  train_examples = None #存放训练样本，type:list
   num_train_steps = None
   num_warmup_steps = None
   if FLAGS.do_train:
+    # 训练数据的处理
     train_examples = processor.get_train_examples(FLAGS.data_dir)
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
+  # estimator 定义model_fn
   model_fn = model_fn_builder(
       bert_config=bert_config,
       num_labels=len(label_list),
@@ -856,7 +895,10 @@ def main(_):
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
+  # 定义estimator：
+  # 1.定义model_fn; 2.定义run_config;
+  #estimator = tf.contrib.tpu.TPUEstimator(
+  estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
       use_tpu=FLAGS.use_tpu,
       model_fn=model_fn,
       config=run_config,
@@ -864,7 +906,9 @@ def main(_):
       eval_batch_size=FLAGS.eval_batch_size,
       predict_batch_size=FLAGS.predict_batch_size)
 
+  # ===== 训练过程 =====
   if FLAGS.do_train:
+    # 生成tfrecord训练数据
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
     file_based_convert_examples_to_features(
         train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
@@ -872,13 +916,19 @@ def main(_):
     tf.logging.info("  Num examples = %d", len(train_examples))
     tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
     tf.logging.info("  Num steps = %d", num_train_steps)
+
+    # estimator 定义input_fn
     train_input_fn = file_based_input_fn_builder(
         input_file=train_file,
         seq_length=FLAGS.max_seq_length,
         is_training=True,
         drop_remainder=True)
+
+    # 开始训练过程：
+    # 1. 传入input_fn; 2.传入max_steps;
     estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
+  # ===== eval过程 =====
   if FLAGS.do_eval:
     eval_examples = processor.get_dev_examples(FLAGS.data_dir)
     num_actual_eval_examples = len(eval_examples)
@@ -925,6 +975,7 @@ def main(_):
         tf.logging.info("  %s = %s", key, str(result[key]))
         writer.write("%s = %s\n" % (key, str(result[key])))
 
+  # ===== 测试过程 =====
   if FLAGS.do_predict:
     predict_examples = processor.get_test_examples(FLAGS.data_dir)
     num_actual_predict_examples = len(predict_examples)
@@ -978,4 +1029,5 @@ if __name__ == "__main__":
   flags.mark_flag_as_required("vocab_file")
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
-  tf.app.run()
+  #tf.app.run()
+  tf.compat.v1.app.run()
